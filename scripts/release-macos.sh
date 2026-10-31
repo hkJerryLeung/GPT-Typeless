@@ -18,6 +18,9 @@ if [[ -z "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" || -z "${TAURI_SIGNING_PRIVATE_KE
   exit 1
 fi
 
+# Tauri's build command reads this variable as a key string or a file path.
+export TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY_PATH"
+
 node node_modules/@tauri-apps/cli/tauri.js build --bundles app
 bundle="src-tauri/target/release/bundle/macos/GPT-Typeless.app"
 requirement="identifier com.gpttypeless and certificate leaf = H\"$signing_id\""
