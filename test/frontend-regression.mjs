@@ -215,6 +215,19 @@ function fixture(options = {}, entry = "App") {
 }
 function click(node) { if (!node.props.disabled) return node.props.onClick?.({}); }
 const change = (node, value) => node.props.onChange({ target: { value } });
+function keyDown(node, options) {
+  let prevented = false;
+  const event = {
+    key: options.key, code: options.code ?? "", repeat: options.repeat ?? false,
+    metaKey: options.metaKey ?? false, ctrlKey: options.ctrlKey ?? false,
+    altKey: options.altKey ?? false, shiftKey: options.shiftKey ?? false,
+    nativeEvent: { isComposing: options.isComposing ?? false },
+    getModifierState: name => name === "Fn" ? !!options.fn : name === "AltGraph" ? !!options.altGraph : false,
+    preventDefault() { prevented = true; },
+  };
+  node.props.onKeyDown(event);
+  return { event, prevented };
+}
 const record = screen => click(screen.classNode("record-btn"));
 const hotkey = (screen, payload) => screen.emit("hotkey-triggered", payload);
 async function settings(screen, tab = "設定") { click(screen.byId("open-settings")); await screen.drain(); click(screen.button(tab)); await screen.drain(); }
@@ -785,6 +798,85 @@ const tests = [
   }],
   ["saving failure keeps the settings draft and does not change live config", async () => {
     const s = fixture({ saveFailure: true }); await s.drain(); await settings(s, "AI 服務"); change(s.byId("token-input"), "synthetic-draft"); await s.drain(); click(s.classNode("modal-save-btn")); await s.drain(); assert.equal(s.byId("token-input").props.value, "synthetic-draft"); assert.equal(s.config.chatgpt_token, "synthetic-token"); assert.match(s.text(), /mock save failure/);
+  }],
+  ["shortcut field captures a single key and saves only on confirmation", async () => {
+    const s = fixture({ config: { fn_shortcut_enabled: true }, fnAvailable: true }); await s.drain(); await settings(s);
+    const field = s.byId("hotkey-input");
+    assert.equal(field.props["aria-describedby"], "shortcut-help shortcut-feedback");
+    assert.match(s.nodeText(s.byId("shortcut-help")), /單鍵會在其他 App 取代原本功能/);
+    assert.match(s.nodeText(s.byId("shortcut-help")), /輸入監控/);
+    assert.match(s.nodeText(s.byId("shortcut-help")), /Logitech Options\+/);
+    field.props.onFocus(); await s.drain(); assert.match(s.nodeText(s.byId("shortcut-feedback")), /請按下單鍵或組合鍵/);
+    assert.equal(keyDown(s.byId("hotkey-input"), { key: "a", code: "KeyA" }).prevented, true); await s.drain();
+    assert.equal(s.byId("hotkey-input").props.value, "A");
+    assert.equal(s.byId("shortcut-feedback").props.role, "status");
+    assert.match(s.nodeText(s.byId("shortcut-feedback")), /儲存後生效/);
+    assert.equal(s.count("set_config"), 0); assert.equal(s.config.hotkey, "Cmd+Shift+R");
+    click(s.classNode("modal-save-btn")); await s.drain();
+    assert.equal(s.config.hotkey, "A"); assert.equal(s.config.fn_shortcut_enabled, true);
+    assert.equal(s.count("request_input_monitoring"), 0);
+  }],
+  ["shortcut capture uses physical keys for function keys, punctuation, and combinations", async () => {
+    const s = fixture(); await s.drain(); await settings(s);
+    for (const [event, expected] of [
+      [{ key: "F1", code: "F1", fn: true }, "F1"],
+      [{ key: "F20", code: "F20" }, "F20"],
+      [{ key: "R", code: "KeyR", metaKey: true, shiftKey: true }, "Cmd+Shift+R"],
+      [{ key: "+", code: "Equal", ctrlKey: true, shiftKey: true }, "Ctrl+Shift+="],
+      [{ key: "é", code: "KeyE", altKey: true, altGraph: true }, "Alt+E"],
+      [{ key: "Dead", code: "KeyE", altKey: true }, "Alt+E"],
+      [{ key: "e", code: "KeyE", ctrlKey: true, altKey: true, altGraph: true }, "Ctrl+Alt+E"],
+      [{ key: "+", code: "NumpadAdd" }, "NumpadAdd"],
+      [{ key: " ", code: "Space" }, "Space"],
+    ]) {
+      assert.equal(keyDown(s.byId("hotkey-input"), event).prevented, true); await s.drain();
+      assert.equal(s.byId("hotkey-input").props.value, expected);
+    }
+    click(s.byLabel("重設快捷鍵")); await s.drain();
+    assert.equal(s.byId("hotkey-input").props.value, "Cmd+Shift+R");
+    assert.match(s.nodeText(s.byId("shortcut-feedback")), /已重設/);
+  }],
+  ["shortcut capture rejects unsupported keys without changing the draft", async () => {
+    const s = fixture(); await s.drain(); await settings(s);
+    for (const event of [
+      { key: "Shift", code: "ShiftLeft", shiftKey: true }, { key: "Fn", code: "Fn" },
+      { key: "CapsLock", code: "CapsLock" }, { key: "F21", code: "F21" },
+      { key: "MediaPlayPause", code: "F8" }, { key: "AudioVolumeUp", code: "AudioVolumeUp" },
+      { key: "LaunchApplication1", code: "F13" },
+      { key: "Unidentified", code: "KeyA" }, { key: "a", code: "KeyA", isComposing: true },
+      { key: " ", code: "Space", fn: true },
+    ]) {
+      assert.equal(keyDown(s.byId("hotkey-input"), event).prevented, true); await s.drain();
+      assert.equal(s.byId("hotkey-input").props.value, "Cmd+Shift+R");
+      assert.match(s.nodeText(s.byId("shortcut-feedback")), /不能|未能|不支援|Fn 組合鍵/);
+    }
+    keyDown(s.byId("hotkey-input"), { key: "AltGraph", code: "AltRight" }); await s.drain();
+    keyDown(s.byId("hotkey-input"), { key: "a", code: "KeyA", altKey: true, altGraph: true }); await s.drain();
+    assert.equal(s.byId("hotkey-input").props.value, "Cmd+Shift+R");
+    assert.match(s.nodeText(s.byId("shortcut-feedback")), /不支援 AltGr/);
+    s.byId("hotkey-input").props.onKeyUp({ key: "Alt", code: "AltRight" });
+    keyDown(s.byId("hotkey-input"), { key: "b", code: "KeyB", repeat: true }); await s.drain();
+    assert.equal(s.byId("hotkey-input").props.value, "Cmd+Shift+R");
+    assert.equal(s.count("set_config"), 0);
+  }],
+  ["shortcut navigation and other settings inputs retain normal behavior", async () => {
+    const s = fixture(); await s.drain(); await settings(s);
+    for (const key of ["Tab", "Escape"]) {
+      assert.equal(keyDown(s.byId("hotkey-input"), { key, code: key }).prevented, false);
+      assert.equal(s.byId("hotkey-input").props.value, "Cmd+Shift+R");
+    }
+    const language = s.find(n => n.type === "input" && n.props.list === "settings-languages");
+    change(language, "Cantonese"); await s.drain(); assert.equal(s.find(n => n.type === "input" && n.props.list === "settings-languages").props.value, "Cantonese");
+    const dialog = s.find(n => n.props?.role === "dialog" && n.props?.["aria-label"] === "設定");
+    let stopped = false; dialog.props.onKeyDown({ key: "Escape", stopPropagation() { stopped = true; } }); await s.drain();
+    assert.equal(stopped, true); assert.ok(!s.nodes().some(n => n.props?.id === "hotkey-input"));
+  }],
+  ["shortcut registration failure keeps the draft and old active setting", async () => {
+    const s = fixture({ saveFailure: true }); await s.drain(); await settings(s);
+    keyDown(s.byId("hotkey-input"), { key: "F13", code: "F13" }); await s.drain();
+    click(s.classNode("modal-save-btn")); await s.drain();
+    assert.equal(s.byId("hotkey-input").props.value, "F13");
+    assert.equal(s.config.hotkey, "Cmd+Shift+R"); assert.match(s.text(), /無法儲存設定.*mock save failure/);
   }],
   ["settings blocks global recording while still allowing local microphone tests", async () => {
     const s = fixture(); await s.drain(); await settings(s); hotkey(s, true); hotkey(s, false); await s.drain(); assert.equal(s.count("start_recording"), 0); click(s.byId("test-microphone-btn")); await s.drain(); assert.equal(s.count("test_microphone"), 1);

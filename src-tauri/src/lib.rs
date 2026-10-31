@@ -4,7 +4,9 @@ mod dictation;
 mod fn_shortcut;
 mod macos_input;
 mod microphone;
+mod recording_shortcut;
 mod setup_drag;
+mod single_key_shortcut;
 mod storage;
 mod text_ai;
 mod updater;
@@ -12,10 +14,11 @@ mod updater;
 use api::TranscribeClient;
 use audio::{AudioDevice, AudioManager, StopRecordingResult};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use storage::{AppConfig, Storage, TranscriptionHistory};
 use tauri::{Emitter, Manager, State};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::ShortcutState;
 
 // Read-only local permission diagnostics. Never prompts, captures text or loads keys.
 pub fn diagnose_permissions() -> Result<(), String> {
@@ -76,8 +79,11 @@ pub fn diagnose_audio(hold_ms: u64, directory: std::path::PathBuf) -> Result<(),
 pub struct AppState {
     audio_manager: AudioManager,
     storage: Storage,
-    shortcut: Mutex<Option<Shortcut>>,
-    config_lock: tokio::sync::Mutex<()>,
+    shortcut: Mutex<recording_shortcut::RegistrationState>,
+    shortcut_router: recording_shortcut::SharedRouter,
+    shortcut_cleanup_warning: recording_shortcut::CleanupWarning,
+    main_focused: Arc<AtomicBool>,
+    config_lock: Arc<tokio::sync::Mutex<()>>,
     target: Mutex<Option<TargetContext>>,
     fn_shortcut: Mutex<Option<fn_shortcut::FnShortcut>>,
     fn_error: Mutex<Option<String>>,
@@ -300,47 +306,62 @@ async fn set_config(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let save_guard = state.update_gate.begin_settings_save()?;
-    let _guard = state.config_lock.lock().await;
+    let guard = state.config_lock.clone().lock_owned().await;
     config.chatgpt_token = storage::normalize_token(&config.chatgpt_token)?;
-    let shortcut: Shortcut = config
-        .hotkey
-        .parse()
-        .map_err(|e| format!("快捷鍵格式無效: {e}"))?;
-    let previous = *state.shortcut.lock().map_err(|e| e.to_string())?;
-    if previous != Some(shortcut) {
-        app.global_shortcut()
-            .register(shortcut)
-            .map_err(|e| format!("快捷鍵無法註冊，可能已被其他 App 使用: {e}"))?;
-    }
-    let fn_enabled = config.fn_shortcut_enabled;
-    let disable_updates = !config.auto_update_enabled;
-    let storage = state.storage.clone();
-    let update_gate = state.update_gate.clone();
-    let worker_guard = save_guard.clone();
     let saved = tauri::async_runtime::spawn_blocking(move || {
-        let _worker_guard = worker_guard;
-        storage.save_config(&config)?;
-        if disable_updates {
-            update_gate.cancel_update()?;
-        }
+        // Keep the transaction alive even if the invoking webview goes away.
+        let _guard = guard;
+        let _save_guard = save_guard;
+        let state = app.state::<AppState>();
+        let spec = recording_shortcut::parse(&config.hotkey)?;
+        let change = {
+            let current = state.shortcut.lock().unwrap_or_else(|e| e.into_inner());
+            current
+                .active
+                .as_ref()
+                .is_none_or(|active| active.spec != spec || active.status().is_err())
+        };
+        let candidate = if change {
+            Some(recording_shortcut::Registration::prepare(
+                &app,
+                spec,
+                &state.shortcut_router,
+                &state.shortcut_cleanup_warning,
+                &state.main_focused,
+            )?)
+        } else {
+            None
+        };
+        // Do not report a failure after settings were already written.
+        let saved = if !config.auto_update_enabled {
+            state
+                .update_gate
+                .cancel_update()
+                .and_then(|_| state.storage.save_config(&config))
+        } else {
+            state.storage.save_config(&config)
+        };
+        recording_shortcut::finish_change(
+            candidate,
+            saved,
+            |registration| registration.activate(&state.shortcut_router, &app),
+            |registration| {
+                let mut current = state.shortcut.lock().unwrap_or_else(|e| e.into_inner());
+                current.error = None;
+                current.active.replace(registration)
+            },
+        )?;
+        state
+            .shortcut
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error = None;
+        update_fn_shortcut(&app, &state, config.fn_shortcut_enabled);
         Ok::<(), String>(())
     })
     .await
     .map_err(|e| e.to_string())?;
-    if let Err(error) = saved {
-        if previous != Some(shortcut) {
-            let _ = app.global_shortcut().unregister(shortcut);
-        }
-        return Err(error);
-    }
-    if previous != Some(shortcut) {
-        if let Some(old) = previous {
-            let _ = app.global_shortcut().unregister(old);
-        }
-        *state.shortcut.lock().map_err(|e| e.to_string())? = Some(shortcut);
-    }
-    update_fn_shortcut(&app, &state, fn_enabled);
-    Ok(())
+    saved
 }
 
 #[tauri::command]
@@ -357,10 +378,20 @@ async fn set_translation_language(
 
 #[tauri::command]
 fn check_hotkey(state: State<'_, AppState>) -> Result<(), String> {
-    if state.shortcut.lock().map_err(|e| e.to_string())?.is_some() {
-        Ok(())
-    } else {
-        Err("未能啟用全域快捷鍵，可能已被其他程式使用。請喺設定更改快捷鍵再儲存；亦可以使用錄音按鈕。".into())
+    if let Some(warning) = state
+        .shortcut_cleanup_warning
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+    {
+        return Err(warning);
+    }
+    let shortcut = state.shortcut.lock().map_err(|e| e.to_string())?;
+    match &shortcut.active {
+        Some(active) => active.status(),
+        None => Err(shortcut.error.clone().unwrap_or_else(|| {
+            "未能啟用全域快捷鍵；請喺設定更改快捷鍵再儲存，亦可以使用錄音按鈕。".into()
+        })),
     }
 }
 
@@ -907,6 +938,12 @@ async fn request_input_monitoring(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     let context = tauri::generate_context!();
     let builder = tauri::Builder::default();
+    let shortcut_router: recording_shortcut::SharedRouter =
+        Arc::new(Mutex::new(Default::default()));
+    let plugin_router = shortcut_router.clone();
+    // Fail open for typing until the main window's focus is known.
+    let main_focused = Arc::new(AtomicBool::new(true));
+    let focus_observer = main_focused.clone();
     // Do not prevent the rest of the app from starting before the parent
     // supplies a complete, signed-version updater configuration.
     let builder = if updater::configured(context.config()) {
@@ -918,12 +955,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _, event| {
-                    let _ = app.emit("hotkey-triggered", event.state() == ShortcutState::Pressed);
+                .with_handler(move |app, shortcut, event| {
+                    recording_shortcut::dispatch(
+                        &plugin_router,
+                        app,
+                        recording_shortcut::RouteId::Global(shortcut.id()),
+                        event.state() == ShortcutState::Pressed,
+                    );
                 })
                 .build(),
         )
-        .setup(|app| {
+        .setup(move |app| {
             let _ = macos_input::start_target_tracking();
             let voice_bar = tauri::WebviewWindowBuilder::new(
                 app,
@@ -981,19 +1023,36 @@ pub fn run() {
             // Old recordings are removed locally; they are never uploaded on startup.
             audio_manager.cleanup_old_recordings(7)?;
             let config = storage.load_settings()?;
-            let shortcut: Shortcut = config.hotkey.parse()?;
-            let active = match app.global_shortcut().register(shortcut) {
-                Ok(()) => Some(shortcut),
-                Err(e) => {
-                    eprintln!("快捷鍵註冊失敗，請喺設定更改: {e}");
-                    None
-                }
-            };
+            let focused = app
+                .get_webview_window("main")
+                .and_then(|window| window.is_focused().ok())
+                .unwrap_or(true);
+            main_focused.store(focused, Ordering::Release);
+            let cleanup_warning: recording_shortcut::CleanupWarning = Arc::new(Mutex::new(None));
+            let initial = recording_shortcut::parse(&config.hotkey).and_then(|spec| {
+                recording_shortcut::Registration::prepare(
+                    app.handle(),
+                    spec,
+                    &shortcut_router,
+                    &cleanup_warning,
+                    &main_focused,
+                )
+            });
+            let (active, error) =
+                recording_shortcut::initial_registration(initial, |registration| {
+                    registration.activate(&shortcut_router, app.handle());
+                });
+            if let Some(error) = &error {
+                eprintln!("快捷鍵未能啟用: {error}");
+            }
             app.manage(AppState {
                 audio_manager,
                 storage,
-                shortcut: Mutex::new(active),
-                config_lock: tokio::sync::Mutex::new(()),
+                shortcut: Mutex::new(recording_shortcut::RegistrationState { active, error }),
+                shortcut_router,
+                shortcut_cleanup_warning: cleanup_warning,
+                main_focused,
+                config_lock: Arc::new(tokio::sync::Mutex::new(())),
                 target: Mutex::new(None),
                 fn_shortcut: Mutex::new(None),
                 fn_error: Mutex::new(None),
@@ -1006,12 +1065,19 @@ pub fn run() {
             );
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(move |window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::Focused(focused) = event {
+                    focus_observer.store(*focused, Ordering::Release);
+                }
+            }
             #[cfg(target_os = "macos")]
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // Keep the global recording shortcut available after closing the window.
                 api.prevent_close();
-                let _ = window.hide();
+                if window.hide().is_ok() && window.label() == "main" {
+                    focus_observer.store(false, Ordering::Release);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![

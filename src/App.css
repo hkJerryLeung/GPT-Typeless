@@ -261,7 +261,9 @@ kbd { font-family:inherit; display:inline-flex; align-items:center; justify-cont
 .setting-control .control-stack { max-width:100%; }
 .control-stack { display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
 .shortcut-editor { display:flex; gap:7px; align-items:center; position:relative; border:1px solid var(--border); border-radius:7px; padding:6px 7px; }
+.shortcut-editor:focus-within { outline:2px solid var(--ring); outline-offset:2px; }
 .shortcut-editor input { position:absolute; inset:0 36px 0 0; width:calc(100% - 36px); color:transparent; background:transparent; border:0; cursor:pointer; caret-color:transparent; }
+.shortcut-editor input:focus-visible { outline:0; }
 .shortcut-editor .keycaps { pointer-events:none; }
 .shortcut-editor .icon-button { z-index:1; }
 .settings-intro { color:var(--secondary); font-size:12px; line-height:1.8; margin-top:12px; max-width:540px; }

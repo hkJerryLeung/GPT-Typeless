@@ -21,12 +21,62 @@ const providerPresets: Record<ProviderConfig["kind"], { name: string; base_url: 
   anthropic: { name: "Anthropic", base_url: "https://api.anthropic.com/v1", model: "" },
   "openai-compatible": { name: "OpenAI 相容", base_url: "", model: "" },
 };
-function captureShortcut(event: KeyboardEvent<HTMLInputElement>, update: (shortcut: string) => void) {
-  if (["Tab", "Escape"].includes(event.key)) return;
+// The native shortcut parser uses physical key codes, not the character produced
+// by the current layout or by Shift/Option. Keep this list within the keys the
+// macOS backend can both parse and map to a scancode.
+const shortcutKeyNames: Record<string, string> = {
+  Backquote: "`", Backslash: "\\", BracketLeft: "[", BracketRight: "]", Comma: ",",
+  Equal: "=", Minus: "-", Period: ".", Quote: "'", Semicolon: ";", Slash: "/",
+  Backspace: "Backspace", Delete: "Delete", Enter: "Enter", Space: "Space",
+  ArrowDown: "ArrowDown", ArrowLeft: "ArrowLeft", ArrowRight: "ArrowRight", ArrowUp: "ArrowUp",
+  Home: "Home", End: "End", Insert: "Insert", PageUp: "PageUp", PageDown: "PageDown",
+  NumpadAdd: "NumpadAdd", NumpadDecimal: "NumpadDecimal", NumpadDivide: "NumpadDivide",
+  NumpadEnter: "NumpadEnter", NumpadEqual: "NumpadEqual", NumpadMultiply: "NumpadMultiply",
+  NumpadSubtract: "NumpadSubtract",
+};
+const modifierKeys = new Set(["Meta", "Shift", "Alt", "Control", "AltGraph", "Fn", "FnLock", "Hyper", "Super", "OS", "CapsLock", "NumLock", "ScrollLock", "Symbol", "SymbolLock"]);
+const namedShortcutKeys = new Set(["Backspace", "Delete", "Enter", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "Home", "End", "Insert", "PageUp", "PageDown", "Clear", "Dead"]);
+
+function captureShortcut(event: KeyboardEvent<HTMLInputElement>, altGraphDown: boolean, update: (shortcut: string) => void, feedback: (message: string) => void) {
+  // Preserve keyboard navigation and the dialog's Escape-to-close behavior.
+  if (event.key === "Tab" || event.key === "Escape") return;
   event.preventDefault();
-  if (["Meta", "Shift", "Alt", "Control"].includes(event.key)) return;
-  const keys = [event.metaKey ? "Cmd" : "", event.ctrlKey ? "Ctrl" : "", event.altKey ? "Alt" : "", event.shiftKey ? "Shift" : "", event.code === "Space" ? "Space" : event.key.length === 1 ? event.key.toUpperCase() : event.key].filter(Boolean);
-  if (keys.length > 1) update(keys.join("+"));
+  if (event.repeat) return;
+  if (altGraphDown) {
+    feedback("不支援 AltGr；請使用其他修飾鍵和一般按鍵。");
+    return;
+  }
+  if (modifierKeys.has(event.key) || modifierKeys.has(event.code)) {
+    feedback("請再按一個按鍵；Fn 和單獨的修飾鍵不能在這裏設定。");
+    return;
+  }
+  if (event.nativeEvent.isComposing || event.key === "Process" || event.key === "Unidentified") {
+    feedback("未能辨認此按鍵，請使用一般按鍵或功能鍵。");
+    return;
+  }
+  const code = event.code || event.key;
+  const isFunctionKey = /^F(?:[1-9]|1\d|20)$/.test(code);
+  // Fn may be needed to produce an F-key, but is not a supported modifier in
+  // this shortcut format. Its separate native gestures remain unchanged.
+  if (event.getModifierState("Fn") && !isFunctionKey) {
+    feedback("Fn 組合鍵請使用下方的 Fn 快捷鍵設定。");
+    return;
+  }
+  const key = /^Key[A-Z]$/.test(code) ? code.slice(3)
+    : /^Digit[0-9]$/.test(code) ? code.slice(5)
+    : /^Numpad[0-9]$/.test(code) || isFunctionKey ? code
+    : !event.code && /^[a-z0-9]$/i.test(event.key) ? event.key.toUpperCase()
+    : shortcutKeyNames[code];
+  // Media and vendor-specific keys can report a supported physical code on
+  // some keyboards; don't silently turn those events into a different key.
+  const recognizedKey = event.key.length === 1 || namedShortcutKeys.has(event.key) || (isFunctionKey && event.key === code);
+  if (!key || !recognizedKey) {
+    feedback("不支援此按鍵。請使用一般按鍵、F1–F20 或其組合。");
+    return;
+  }
+  const shortcut = [event.metaKey ? "Cmd" : "", event.ctrlKey ? "Ctrl" : "", event.altKey ? "Alt" : "", event.shiftKey ? "Shift" : "", key].filter(Boolean).join("+");
+  update(shortcut);
+  feedback(`已選擇 ${shortcut}，儲存後生效。`);
 }
 
 export function SettingsDialog(props: Props) {
@@ -35,9 +85,11 @@ export function SettingsDialog(props: Props) {
   const [saving, setSaving] = useState(false);
   const [working, setWorking] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [shortcutFeedback, setShortcutFeedback] = useState("");
   const [testResult, setTestResult] = useState<{ id: string; text: string } | null>(null);
   const [insertionResult, setInsertionResult] = useState<{ text: string; failed: boolean } | null>(null);
   const workRef = useRef(false);
+  const altGraphDown = useRef(false);
   const update = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => setDraft(previous => {
     const next = { ...previous, [key]: value };
     return { ...next, web_search_enabled: next.web_search_enabled && next.providers.some(p => p.id === next.active_provider_id && p.kind === "gemini") };
@@ -78,12 +130,14 @@ export function SettingsDialog(props: Props) {
         <fieldset className="settings-fieldset" disabled={locked}>
         {tab === "general" && <>
           <section className="settings-section"><h3><Keyboard />鍵盤快捷鍵</h3>
-            <SettingRow title="全域錄音" description="使用首頁選取的模式。在其他應用程式也能啟動。"><div className="shortcut-editor"><Keycaps shortcut={draft.hotkey} /><input id="hotkey-input" aria-label="按下新的快捷鍵" value={draft.hotkey} readOnly onKeyDown={e => captureShortcut(e, value => update("hotkey", value))} title="點選後按下新的組合鍵" /><button className="icon-button" title="重設為 ⌘⇧R" aria-label="重設快捷鍵" onClick={() => update("hotkey", "Cmd+Shift+R")}><RotateCcw size={15} /></button></div></SettingRow>
+            <SettingRow title="全域錄音" description="使用首頁選取的模式。在其他應用程式也能啟動。"><div className="shortcut-editor"><Keycaps shortcut={draft.hotkey} /><input id="hotkey-input" aria-label="設定全域錄音快捷鍵" aria-describedby="shortcut-help shortcut-feedback" value={draft.hotkey} readOnly onFocus={() => setShortcutFeedback("請按下單鍵或組合鍵。Tab 切換欄位，Esc 關閉設定。")} onBlur={() => { altGraphDown.current = false; }} onKeyDown={e => { if (e.key === "AltGraph") altGraphDown.current = true; captureShortcut(e, altGraphDown.current, value => update("hotkey", value), setShortcutFeedback); }} onKeyUp={e => { if (e.key === "AltGraph" || e.code === "AltRight") altGraphDown.current = false; }} title="點選後按下單鍵或組合鍵" /><button className="icon-button" title="重設為 ⌘⇧R" aria-label="重設快捷鍵" onClick={() => { update("hotkey", "Cmd+Shift+R"); setShortcutFeedback("已重設為 Cmd+Shift+R，儲存後生效。"); }}><RotateCcw size={15} /></button></div></SettingRow>
+            <p id="shortcut-help" className="hint">可使用一般按鍵、F1–F20 或組合鍵。單鍵會在其他 App 取代原本功能，並需要「控制其他 App」及「輸入監控」權限；部分廠商專用鍵需先用 Logitech Options+ 指派為一般按鍵。</p>
+            <p id="shortcut-feedback" className="hint" role="status">{shortcutFeedback}</p>
             <SettingRow title="快捷鍵操作" description="錄音按鈕始終是點一下開始，再點一下完成。"><select id="shortcut-behavior" value={draft.shortcut_behavior} onChange={e => update("shortcut_behavior", e.target.value as AppConfig["shortcut_behavior"])}><option value="hold">按住說話，鬆開完成</option><option value="toggle">按一下開始，再按一下完成</option></select></SettingRow>
             <SettingRow title="使用 Fn 快捷鍵" description="Fn 聽寫、Fn⇧ 翻譯、Fn Space 問 AI；按一下開始，再按一下完成。"><Toggle label="使用 Fn 快捷鍵" checked={draft.fn_shortcut_enabled} onChange={value => update("fn_shortcut_enabled", value)} /></SettingRow>
             <p className="hint" role="status">{draft.fn_shortcut_enabled !== props.config.fn_shortcut_enabled ? "儲存後套用 Fn 設定。" : props.fnStatus?.message || "尚未確認 Fn 快捷鍵狀態。"}</p>
             <p className="hint">部分 Logitech 鍵盤嘅 Fn 不會傳送給 macOS；可使用上方全域快捷鍵。</p>
-            {!props.fnStatus?.available && <SettingRow title="Fn 權限" description="需要你允許控制其他 App 與輸入監控；Fn 可能取代 macOS 原本的 Fn 操作。原有全域快捷鍵仍可使用。"><div className="control-stack"><button className="button" onClick={() => void run("fn-permission", props.onRequestFnPermission)}>開啟輸入監控設定</button>{props.config.fn_shortcut_enabled && <button className="text-button" onClick={() => void run("fn-retry", props.onRefreshFn)}>重新檢查 Fn</button>}</div></SettingRow>}
+            {!props.fnStatus?.available && <SettingRow title="單鍵及 Fn 權限" description="使用單鍵或 Fn 需要允許控制其他 App 與輸入監控；Fn 可能取代 macOS 原本的 Fn 操作。原有組合鍵仍可使用。"><div className="control-stack"><button className="button" onClick={() => void run("fn-permission", props.onRequestFnPermission)}>開啟輸入監控設定</button>{props.config.fn_shortcut_enabled && <button className="text-button" onClick={() => void run("fn-retry", props.onRefreshFn)}>重新檢查 Fn</button>}</div></SettingRow>}
           </section>
           <section className="settings-section"><h3><Globe2 />語言</h3>
             <SettingRow title="介面語言"><span className="secondary">繁體中文</span></SettingRow>
