@@ -1,0 +1,60 @@
+[package]
+name = "gptservice-tauri"
+version = "1.3.0"
+description = "GPT-Typeless speech transcription (local macOS port)"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "gptservice_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dev-dependencies]
+tauri = { version = "2.12.5", features = ["test"] }
+
+[dependencies]
+tauri = { version = "2.12.5", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2.14.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Audio recording
+cpal = "0.18.2"
+hound = "3.5"
+
+# Global hotkey lifecycle and main-thread dispatch
+tauri-plugin-global-shortcut = "2"
+
+# Clipboard
+arboard = "3.3"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Time handling
+chrono = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace", "NSSound", "NSWindow", "NSView", "NSDragging", "NSEvent", "NSColor", "NSPasteboard", "NSPasteboardItem", "objc2-quartz-core", "libc"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSDictionary", "NSNotification", "NSObject", "NSOperation", "NSString", "NSURL", "block2"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString", "CFAttributedString", "CFMachPort", "CFRunLoop", "CFDate"] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXError", "AXUIElement", "AXValue", "libc"] }
+
+
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation", "libc"] }
