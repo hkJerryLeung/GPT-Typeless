@@ -60,6 +60,10 @@ local_paths = [value.encode() for value in sys.argv[2:] if len(value) > 1]
 patterns = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"),
     re.compile(rb"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(rb"AIza[A-Za-z0-9_-]{35}"),
+    re.compile(rb"sk_(?:live|test)_[A-Za-z0-9]{16,}"),
+    re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,}"),
+    re.compile(rb"AKIA[A-Z0-9]{16}"),
     re.compile(rb"eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{12,}"),
     re.compile(rb"/Users/[A-Za-z0-9._-]+/"),
 )
